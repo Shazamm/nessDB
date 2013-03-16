@@ -16,7 +16,6 @@
 #define NESSDB_TOWER_EXT (".TOWER")
 #define REDO_LOG ("ness.REDO")
 
-
 void _make_towername(struct index *idx, int lsn)
 {
 	memset(idx->tower_file, 0, NESSDB_PATH_SIZE);
@@ -49,6 +48,17 @@ void *_thread(void *arg)
     struct index *idx = (struct index*) arg;
 
     for (;;) {
+        /*
+         * here is to save CPU
+         * when queue is empty, it will hang util enqueue
+         */
+        if (idx->queued == 0) {
+            if (idx->exited == 1)
+                goto EXIT;
+            else
+                pthread_mutex_lock(idx->merge_lock);
+        }
+
         if (idx->hdr) {
             struct sst_node *node;
             struct sst *sst;
@@ -59,13 +69,13 @@ void *_thread(void *arg)
             sst = node->sst;
             _merge_job(idx, sst);
             xfree(node);
-            idx->queued--;
-
-            __DEBUG(" ---dequeue, %d", idx->queued);
-        }
+            atomic_dec(idx->queued);
+        } 
     }
 
-    return NULL;
+EXIT:
+    pthread_detach(pthread_self());
+    pthread_exit(NULL);
 }
 
 void _build_tower(struct index *idx)
@@ -121,12 +131,14 @@ void _check(struct index *idx)
             idx->hdr = node;
             idx->tail = node;
         }
-         idx->queued++;
-         __DEBUG("---queue#%d", idx->queued);
+         atomic_inc(idx->queued);
 
 		_make_towername(idx, ++idx->lsn);
 		idx->sst = sst_new(idx->tower_file, idx->stats);
-	}
+
+        if (idx->hdr)
+            pthread_mutex_unlock(idx->merge_lock);
+    }
 }
 
 uint64_t _wasted(struct index *idx)
@@ -423,6 +435,10 @@ int index_get(struct index *idx, struct slice *sk, struct slice *sv)
 		.vlen = 0
 	};
 
+    /*
+     * TODO: query from the merging queue on bg-thread
+     */
+
 	_get_ol_pair(idx, &pair, sk);
 
 	if (pair.offset == 0UL)
@@ -467,7 +483,6 @@ int index_remove(struct index *idx, struct slice *sk)
 		return 0;
 	}
 
-
 	idx->stats->STATS_REMOVES++;
 	return index_add(idx, sk, NULL);
 }
@@ -475,6 +490,11 @@ int index_remove(struct index *idx, struct slice *sk)
 void _flush_index(struct index *idx)
 {
 	__DEBUG("begin to flush TOWER to disk...");
+
+    idx->exited = 1;
+    if (pthread_mutex_trylock(idx->merge_lock))
+        pthread_mutex_unlock(idx->merge_lock);
+
     while(idx->queued > 0);
 }
 
@@ -670,8 +690,6 @@ void index_free(struct index *idx)
 	meta_free(idx->meta);
 	buffer_free(idx->buf);
 
-	pthread_mutex_unlock(idx->merge_lock);
-	pthread_mutex_destroy(idx->merge_lock);
 	xfree(idx->merge_lock);
 	flock(idx->fd, LOCK_UN);
 

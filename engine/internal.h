@@ -45,6 +45,9 @@
 	# define N_CREAT_FLAGS  (O_RDWR | O_TRUNC | O_CREAT |\
 			O_BINARY | O_LARGEFILE)
 	# define N_OPEN_FLAGS   (O_RDWR | O_BINARY | O_LARGEFILE)
+
+    #define atomic_inc(P) __sync_add_and_fetch((P), 1)
+    #define atomic_dec(P) __sync_add_and_fetch((P), -1) 
 #else
 	# define n_open (open)
 	# define n_lseek (lseek)
@@ -53,6 +56,9 @@
 	# define n_pread64 (pread)
 	# define N_CREAT_FLAGS  (O_RDWR | O_TRUNC | O_CREAT | O_BINARY)
 	# define N_OPEN_FLAGS   (O_RDWR | O_BINARY)
+
+    #define atomic_inc(P) (P++)
+    #define atomic_dec(P) (P--)
 #endif
 
 #define NESSDB_VERSION ("v2.0")               /* nessDB version flag   */

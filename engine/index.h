@@ -38,6 +38,7 @@ struct index {
 	qlz_state_decompress destate;
 
     int queued;
+    int exited;
     struct sst_node *hdr;
     struct sst_node *tail;
 
