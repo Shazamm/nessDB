@@ -14,10 +14,9 @@ struct ness_kv {
 	struct slice sv;
 };
 
-struct parking {
-	int lsn;
-	int async;
-	struct sst *merging_sst;
+struct sst_node {
+    struct sst *sst;
+    struct sst_node *nxt;
 };
 
 struct index {
@@ -35,9 +34,12 @@ struct index {
 	struct buffer *buf;
 	struct stats *stats;
 	struct sst *sst;
-	struct parking park;
 	qlz_state_compress enstate;
 	qlz_state_decompress destate;
+
+    int queued;
+    struct sst_node *hdr;
+    struct sst_node *tail;
 
 	pthread_attr_t attr;
 	pthread_mutex_t *merge_lock;

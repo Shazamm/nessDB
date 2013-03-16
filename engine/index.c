@@ -16,6 +16,7 @@
 #define NESSDB_TOWER_EXT (".TOWER")
 #define REDO_LOG ("ness.REDO")
 
+
 void _make_towername(struct index *idx, int lsn)
 {
 	memset(idx->tower_file, 0, NESSDB_PATH_SIZE);
@@ -25,24 +26,12 @@ void _make_towername(struct index *idx, int lsn)
 			NESSDB_TOWER_EXT);
 }
 
-void *_merge_job(void *arg)
+void _merge_job(struct index *idx, struct sst *sst)
 {
 	int i;
-	int lsn;
-	int async;
 	int c = 0;
-
-	struct sst_item *items;
-	struct meta_node *node;
-
-	struct sst *sst;
-	struct index *idx = (struct index *)arg;
-
-	pthread_mutex_lock(idx->merge_lock);
-
-	sst = idx->park.merging_sst;
-	lsn = idx->park.lsn;
-	async = idx->park.async;
+    struct sst_item *items;
+    struct meta_node *node;
 
 	items = sst_in_one(sst, &c);
 	for (i = 0; i < c; i++) {
@@ -51,21 +40,32 @@ void *_merge_job(void *arg)
 	}
 	xfree(items);
 
-	idx->park.merging_sst = NULL;
-
-	/*
-	 * remove merged TOWER
-	 */
-	_make_towername(idx, lsn);
-	remove(idx->tower_file);
+	remove(sst->file);
 	sst_free(sst);
+}
 
-	pthread_mutex_unlock(idx->merge_lock);
-	if (async) {
-		pthread_detach(pthread_self());
-		pthread_exit(NULL);
-	} else
-		return NULL;
+void *_thread(void *arg)
+{
+    struct index *idx = (struct index*) arg;
+
+    for (;;) {
+        if (idx->hdr) {
+            struct sst_node *node;
+            struct sst *sst;
+
+            node = idx->hdr;
+            idx->hdr = node->nxt;
+
+            sst = node->sst;
+            _merge_job(idx, sst);
+            xfree(node);
+            idx->queued--;
+
+            __DEBUG(" ---dequeue, %d", idx->queued);
+        }
+    }
+
+    return NULL;
 }
 
 void _build_tower(struct index *idx)
@@ -98,33 +98,31 @@ void _build_tower(struct index *idx)
 	}
 	closedir(dd);
 
-	/*
-	 * redo older tower
-	 */
 	for (; i > 0; i--) {
 		lsn = (max - i + 1);
 		_make_towername(idx, lsn);
 		sst = sst_new(idx->tower_file, idx->stats);
-		pthread_mutex_lock(idx->merge_lock);
-		idx->park.lsn = lsn;
-		idx->park.async = 0;
-		idx->park.merging_sst = sst;
-		pthread_mutex_unlock(idx->merge_lock);
-		_merge_job(idx);
+		_merge_job(idx, sst);
 	}
 }
 
 void _check(struct index *idx)
 {
 	if (idx->sst->willfull) {
-		pthread_mutex_lock(idx->merge_lock);
-		idx->park.lsn = idx->lsn;
-		idx->park.async = 1;
-		idx->park.merging_sst = idx->sst;
-		pthread_mutex_unlock(idx->merge_lock);
+        struct sst_node *node;
+        
+        node = xcalloc(1, sizeof(struct sst_node));
+        node->sst = idx->sst;
 
-		pthread_t tid;
-		pthread_create(&tid, &idx->attr, _merge_job, idx);
+        if (idx->hdr) {
+            idx->tail->nxt = node;
+            idx->tail = node;
+        } else {
+            idx->hdr = node;
+            idx->tail = node;
+        }
+         idx->queued++;
+         __DEBUG("---queue#%d", idx->queued);
 
 		_make_towername(idx, ++idx->lsn);
 		idx->sst = sst_new(idx->tower_file, idx->stats);
@@ -296,11 +294,9 @@ struct index *index_new(const char *path, struct stats *stats)
 	_make_towername(idx, idx->lsn);
 	idx->sst = sst_new(idx->tower_file, idx->stats);
 
-	/*
-	 * Detached thread attr
-	 */
+    pthread_t tid;
 	pthread_attr_init(&idx->attr);
-	pthread_attr_setdetachstate(&idx->attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&tid, &idx->attr, _thread, idx);
 
 	return idx;
 }
@@ -402,9 +398,6 @@ void _get_ol_pair(struct index *idx, struct ol_pair *pair, struct slice *sk)
 	if (sst_get(idx->sst, sk, pair))
 		goto SST_SEARCH;
 
-	if (idx->park.merging_sst) 
-		sst_get(idx->park.merging_sst, sk, pair);
-
 SST_SEARCH:
 	if (pair->offset == 0UL) {
 		node =  meta_get(idx->meta, sk->data, M_R);
@@ -482,14 +475,7 @@ int index_remove(struct index *idx, struct slice *sk)
 void _flush_index(struct index *idx)
 {
 	__DEBUG("begin to flush TOWER to disk...");
-
-	pthread_mutex_lock(idx->merge_lock);
-	pthread_mutex_unlock(idx->merge_lock);
-
-	/*
-	 * merge TOWER to SST
-	 */
-	_build_tower(idx);
+    while(idx->queued > 0);
 }
 
 void index_shrink(struct index *idx)
